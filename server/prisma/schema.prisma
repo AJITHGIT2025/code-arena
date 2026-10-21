@@ -1,0 +1,113 @@
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+model User {
+  id            String            @id @default(uuid())
+  name          String
+  email         String            @unique
+  passwordHash  String
+  role          String            @default("STUDENT") // STUDENT or ADMIN
+  academicYear  String            @default("1st Year") // 1st Year, 2nd Year, 3rd Year
+  createdAt     DateTime          @default(now())
+  updatedAt     DateTime          @updatedAt
+  submissions   Submission[]
+  progress      ProblemProgress[]
+
+  @@map("users")
+}
+
+model Problem {
+  id                 String             @id @default(uuid())
+  problemCode        String             @unique
+  title              String
+  description        String
+  academicYear       String             // 1st Year, 2nd Year, 3rd Year
+  topic              String             // Arrays, Strings, Recursion, Trees, DP, etc.
+  difficulty         String             // Easy, Medium, Hard
+  points             Int                @default(100)
+  inputFormat        String
+  outputFormat       String
+  constraints        String
+  timeLimit          Float              @default(2.0) // in seconds
+  memoryLimit        Int                @default(256) // in MB
+  isPublished        Boolean            @default(true)
+  starterCodeC       String?
+  starterCodeCpp     String?
+  starterCodeJava    String?
+  starterCodePython  String?
+  createdAt          DateTime           @default(now())
+  updatedAt          DateTime           @updatedAt
+
+  sampleTestCases    SampleTestCase[]
+  hiddenTestCases    HiddenTestCase[]
+  submissions        Submission[]
+  progress           ProblemProgress[]
+
+  @@map("problems")
+}
+
+model SampleTestCase {
+  id             String   @id @default(uuid())
+  problemId      String
+  inputData      String
+  expectedOutput String
+  explanation    String?
+  displayOrder   Int      @default(1)
+  problem        Problem  @relation(fields: [problemId], references: [id], onDelete: Cascade)
+
+  @@map("sample_test_cases")
+}
+
+model HiddenTestCase {
+  id             String   @id @default(uuid())
+  problemId      String
+  inputData      String
+  expectedOutput String
+  pointsOrWeight Int      @default(1)
+  problem        Problem  @relation(fields: [problemId], references: [id], onDelete: Cascade)
+
+  @@map("hidden_test_cases")
+}
+
+model Submission {
+  id              String   @id @default(uuid())
+  userId          String
+  problemId       String
+  language        String   // c, cpp, java, python
+  sourceCode      String
+  status          String   // Accepted, Wrong Answer, Compilation Error, Runtime Error, Time Limit Exceeded
+  passedTestCases Int      @default(0)
+  totalTestCases  Int      @default(0)
+  pointsEarned    Int      @default(0)
+  executionTime   Float?   // in seconds
+  executionMemory Int?     // in KB
+  errorMessage    String?
+  submittedAt     DateTime @default(now())
+
+  user            User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  problem         Problem  @relation(fields: [problemId], references: [id], onDelete: Cascade)
+
+  @@map("submissions")
+}
+
+model ProblemProgress {
+  id        String   @id @default(uuid())
+  userId    String
+  problemId String
+  solved    Boolean  @default(false)
+  bestScore Int      @default(0)
+  attempts  Int      @default(0)
+  updatedAt DateTime @updatedAt
+
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  problem   Problem  @relation(fields: [problemId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, problemId])
+  @@map("problem_progress")
+}

@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: code-arena
+    env: docker
+    plan: free
+    region: oregon
+    dockerfilePath: Dockerfile
+    envVars:
+      - key: PORT
+        value: 5000
+      - key: NODE_ENV
+        value: production
+      - key: DATABASE_URL
+        value: file:./dev.db
+      - key: JWT_SECRET
+        generateValue: true
+      - key: JUDGE0_API_URL
+        value: https://ce.judge0.com

@@ -1,0 +1,32 @@
+{
+  "name": "code-arena",
+  "version": "1.0.0",
+  "description": "CODE ARENA — Programming Practice and Online Coding Platform",
+  "scripts": {
+    "dev": "concurrently -n \"SERVER,CLIENT\" -c \"blue,magenta\" \"npm --prefix server run dev\" \"npm --prefix client run dev\"",
+    "dev:server": "npm --prefix server run dev",
+    "dev:client": "npm --prefix client run dev",
+    "build:client": "npm --prefix client run build",
+    "build:server": "npm --prefix server run build",
+    "build": "npm --prefix client run build && npm --prefix server run build",
+    "start": "npm --prefix server run start",
+    "seed": "npm --prefix server run seed",
+    "test:judge": "npm --prefix server run test:judge",
+    "test": "npm --prefix server run test:suite",
+    "install:all": "npm --prefix server install && npm --prefix client install"
+  },
+  "keywords": [
+    "online-judge",
+    "competitive-programming",
+    "college",
+    "code-arena",
+    "react",
+    "express",
+    "monaco-editor"
+  ],
+  "author": "CODE ARENA Team",
+  "license": "MIT",
+  "devDependencies": {
+    "concurrently": "^9.1.2"
+  }
+}
