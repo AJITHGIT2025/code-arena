@@ -14,6 +14,9 @@ dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 5000;
 
+// Trust reverse proxy for accurate client IPs behind Render/Cloudflare/Nginx
+app.set('trust proxy', 1);
+
 // Security & Middlewares
 app.use(
   cors({
@@ -28,7 +31,17 @@ app.use(express.urlencoded({ extended: true, limit: '2mb' }));
 // Rate limiter for execution and submission endpoints
 const executionLimiter = rateLimit({
   windowMs: 1 * 60 * 1000, // 1 minute
-  max: 30, // max 30 runs/submits per minute per IP
+  max: 120, // max 120 runs/submits per minute
+  keyGenerator: (req) => {
+    // If authenticated, rate limit per student token so whole computer labs sharing one Wi-Fi IP don't block each other
+    const authHeader = req.headers.authorization;
+    if (authHeader && authHeader.startsWith('Bearer ')) {
+      return authHeader.slice(7, 35);
+    }
+    return req.ip || 'anonymous';
+  },
+  standardHeaders: true,
+  legacyHeaders: false,
   message: { error: 'Too many execution requests. Please wait a moment before trying again.' },
 });
 

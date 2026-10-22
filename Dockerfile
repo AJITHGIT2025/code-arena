@@ -43,10 +43,11 @@ COPY --from=server-builder /app/server/dist ./dist
 COPY --from=server-builder /app/server/prisma ./prisma
 COPY --from=server-builder /app/server/node_modules/.prisma ./node_modules/.prisma
 COPY --from=server-builder /app/server/node_modules/@prisma ./node_modules/@prisma
+COPY server/scripts ./scripts
 
 # Copy built client to where the Express server serves static assets
 COPY --from=client-builder /app/client/dist /app/client/dist
 
 EXPOSE 5000
 
-CMD ["sh", "-c", "npx prisma db push && node dist/db/seed.js && node dist/index.js"]
+CMD ["sh", "-c", "node scripts/init-db.js && node dist/index.js"]
