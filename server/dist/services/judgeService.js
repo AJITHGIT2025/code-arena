@@ -20,10 +20,71 @@ class JudgeService {
     apiUrl;
     apiKey;
     apiHost;
+    enginePreference;
+    // Circuit breaker for Judge0 public endpoint
+    judge0FailureCount = 0;
+    judge0CircuitOpenUntil = 0;
+    // Cache for local compiler availability
+    localCompilers = {
+        python: false,
+        c: false,
+        cpp: false,
+        java: false,
+    };
     constructor() {
         this.apiUrl = (process.env.JUDGE0_API_URL || 'https://ce.judge0.com').replace(/\/+$/, '');
         this.apiKey = process.env.JUDGE0_API_KEY || '';
         this.apiHost = process.env.JUDGE0_API_HOST || '';
+        // If an explicit engine is set in .env, use it; otherwise 'auto'
+        const envEngine = (process.env.EXECUTION_ENGINE || '').toLowerCase();
+        if (envEngine === 'local' || envEngine === 'judge0') {
+            this.enginePreference = envEngine;
+        }
+        else {
+            // Default to 'local' if no Judge0 API key is set, because local is instantaneous
+            this.enginePreference = this.apiKey ? 'judge0' : 'local';
+        }
+        this.detectLocalCompilers();
+    }
+    /**
+     * Detect which compilers are available on the local machine/container
+     */
+    detectLocalCompilers() {
+        try {
+            (0, child_process_1.execSync)('python --version', { stdio: 'ignore' });
+            this.localCompilers.python = true;
+        }
+        catch {
+            try {
+                (0, child_process_1.execSync)('python3 --version', { stdio: 'ignore' });
+                this.localCompilers.python = true;
+            }
+            catch {
+                this.localCompilers.python = false;
+            }
+        }
+        try {
+            (0, child_process_1.execSync)('gcc --version', { stdio: 'ignore' });
+            this.localCompilers.c = true;
+        }
+        catch {
+            this.localCompilers.c = false;
+        }
+        try {
+            (0, child_process_1.execSync)('g++ --version', { stdio: 'ignore' });
+            this.localCompilers.cpp = true;
+        }
+        catch {
+            this.localCompilers.cpp = false;
+        }
+        try {
+            (0, child_process_1.execSync)('javac -version', { stdio: 'ignore' });
+            this.localCompilers.java = true;
+        }
+        catch {
+            this.localCompilers.java = false;
+        }
+        console.log('[JudgeService] Detected local toolchains:', this.localCompilers, `(Default Mode: ${this.enginePreference})`);
     }
     /**
      * Normalize output for comparison:
@@ -42,47 +103,245 @@ class JudgeService {
             .trim();
     }
     /**
-     * Execute code with given stdin using Judge0 (primary) or local runner (fallback)
+     * Execute single test case
      */
     async execute(language, sourceCode, stdin = '', timeLimit = 2.0, memoryLimit = 256) {
-        try {
-            return await this.executeViaJudge0(language, sourceCode, stdin, timeLimit, memoryLimit);
-        }
-        catch (err) {
-            console.warn(`[Judge0 Warning] Execution via Judge0 failed (${err.message}). Falling back to local runner...`);
-            return await this.executeViaLocal(language, sourceCode, stdin, timeLimit);
-        }
+        const results = await this.executeBatch(language, sourceCode, [{ input: stdin }], timeLimit, memoryLimit);
+        return results[0];
     }
     /**
-     * Judge0 execution method
+     * Execute code against MULTIPLE test cases in batch.
+     * Prioritizes local execution when available for sub-second speeds.
      */
-    async executeViaJudge0(language, sourceCode, stdin, timeLimit, memoryLimit) {
+    async executeBatch(language, sourceCode, testCases, timeLimit = 2.0, memoryLimit = 256) {
+        if (testCases.length === 0)
+            return [];
+        const isLocalCapable = this.localCompilers[language];
+        const isCircuitOpen = Date.now() < this.judge0CircuitOpenUntil;
+        // Prefer local execution if:
+        // 1) enginePreference is 'local' and local compiler exists
+        // 2) or Judge0 circuit is open (failing/timed out)
+        // 3) or enginePreference is 'auto' without a paid Judge0 key and compiler exists
+        if (isLocalCapable && (this.enginePreference === 'local' || isCircuitOpen || !this.apiKey)) {
+            try {
+                return await this.executeBatchViaLocal(language, sourceCode, testCases, timeLimit);
+            }
+            catch (localErr) {
+                console.warn(`[Local Judge Warning] Local execution failed (${localErr.message}). Attempting Judge0 fallback...`);
+            }
+        }
+        // Try Judge0
+        if (!isCircuitOpen) {
+            try {
+                const results = await this.executeBatchViaJudge0(language, sourceCode, testCases, timeLimit, memoryLimit);
+                this.judge0FailureCount = 0; // Reset circuit breaker on success
+                return results;
+            }
+            catch (judge0Err) {
+                this.judge0FailureCount++;
+                console.warn(`[Judge0 Warning] Request failed: ${judge0Err.message}. (Failure count: ${this.judge0FailureCount})`);
+                if (this.judge0FailureCount >= 2) {
+                    // Open circuit breaker for 60 seconds
+                    this.judge0CircuitOpenUntil = Date.now() + 60 * 1000;
+                    console.warn(`[Judge0 Circuit Breaker] Tripped. Routing all traffic to local runner for 60s.`);
+                }
+            }
+        }
+        // Fall back to local if not already attempted
+        return await this.executeBatchViaLocal(language, sourceCode, testCases, timeLimit);
+    }
+    // ──────────────────────────────────────────────
+    //  Judge0 — Batch API
+    // ──────────────────────────────────────────────
+    async executeBatchViaJudge0(language, sourceCode, testCases, timeLimit, memoryLimit) {
         const languageId = JUDGE0_LANGUAGE_IDS[language];
-        if (!languageId) {
+        if (!languageId)
             throw new Error(`Unsupported language: ${language}`);
-        }
-        const headers = {
-            'Content-Type': 'application/json',
-        };
-        if (this.apiKey) {
-            headers['X-RapidAPI-Key'] = this.apiKey;
-        }
-        if (this.apiHost) {
-            headers['X-RapidAPI-Host'] = this.apiHost;
-        }
-        const payload = {
+        const headers = this.getJudge0Headers();
+        const submissions = testCases.map((tc) => ({
             source_code: sourceCode,
             language_id: languageId,
-            stdin: stdin || '',
-            cpu_time_limit: Math.max(1, Math.min(timeLimit, 10)),
-            memory_limit: memoryLimit * 1024, // in KB
-            wait: true,
-        };
-        const response = await axios_1.default.post(`${this.apiUrl}/submissions?wait=true`, payload, {
-            headers,
-            timeout: 15000,
-        });
-        const data = response.data;
+            stdin: tc.input || '',
+            cpu_time_limit: Math.max(1, Math.min(timeLimit, 5)),
+            memory_limit: memoryLimit * 1024,
+        }));
+        // Submit batch with 6s timeout so it doesn't freeze the user if Judge0 is unresponsive
+        const batchResponse = await axios_1.default.post(`${this.apiUrl}/submissions/batch`, { submissions }, { headers, timeout: 6000 });
+        const tokens = (batchResponse.data || []).map((item) => item.token);
+        if (tokens.length === 0) {
+            throw new Error('Judge0 batch returned no tokens.');
+        }
+        return await this.pollBatchResults(tokens, headers);
+    }
+    async pollBatchResults(tokens, headers) {
+        const tokenStr = tokens.join(',');
+        const maxAttempts = 15;
+        let delay = 350;
+        for (let attempt = 0; attempt < maxAttempts; attempt++) {
+            await this.sleep(delay);
+            try {
+                const resp = await axios_1.default.get(`${this.apiUrl}/submissions/batch`, {
+                    params: { tokens: tokenStr, fields: 'token,stdout,stderr,compile_output,status,time,memory,message' },
+                    headers,
+                    timeout: 5000,
+                });
+                const subs = resp.data?.submissions || resp.data || [];
+                const allDone = subs.every((s) => s.status && s.status.id >= 3);
+                if (allDone) {
+                    const tokenMap = new Map();
+                    for (const s of subs) {
+                        tokenMap.set(s.token, s);
+                    }
+                    return tokens.map((t) => this.mapJudge0Response(tokenMap.get(t) || {}));
+                }
+            }
+            catch (pollErr) {
+                console.warn(`[Judge0 Poll] Attempt ${attempt + 1} warning: ${pollErr.message}`);
+            }
+            delay = Math.min(delay + 150, 1500);
+        }
+        throw new Error('Judge0 batch polling timed out.');
+    }
+    // ──────────────────────────────────────────────
+    //  Local Runner — Compile Once, Run Many
+    // ──────────────────────────────────────────────
+    async executeBatchViaLocal(language, sourceCode, testCases, timeLimit) {
+        const tempDir = fs_1.default.mkdtempSync(path_1.default.join(os_1.default.tmpdir(), 'code-arena-'));
+        try {
+            let runCmd;
+            let runArgs;
+            // 1. Prepare & Compile
+            if (language === 'python') {
+                const filePath = path_1.default.join(tempDir, 'solution.py');
+                fs_1.default.writeFileSync(filePath, sourceCode);
+                runCmd = this.localCompilers.python ? (process.platform === 'win32' ? 'python' : 'python3') : 'python';
+                runArgs = [filePath];
+            }
+            else if (language === 'c') {
+                const srcPath = path_1.default.join(tempDir, 'solution.c');
+                const binPath = path_1.default.join(tempDir, process.platform === 'win32' ? 'solution.exe' : 'solution');
+                fs_1.default.writeFileSync(srcPath, sourceCode);
+                // Fast compilation with -O2
+                const compileRes = await this.runProcess('gcc', [srcPath, '-O2', '-o', binPath, '-lm'], '', tempDir, 6);
+                if (compileRes.exitCode !== 0) {
+                    return testCases.map(() => ({
+                        stdout: null,
+                        stderr: null,
+                        compile_output: compileRes.stderr || compileRes.stdout,
+                        status: { id: 6, description: 'Compilation Error' },
+                        time: null,
+                        memory: null,
+                    }));
+                }
+                runCmd = binPath;
+                runArgs = [];
+            }
+            else if (language === 'cpp') {
+                const srcPath = path_1.default.join(tempDir, 'solution.cpp');
+                const binPath = path_1.default.join(tempDir, process.platform === 'win32' ? 'solution.exe' : 'solution');
+                fs_1.default.writeFileSync(srcPath, sourceCode);
+                const compileRes = await this.runProcess('g++', [srcPath, '-O2', '-o', binPath], '', tempDir, 6);
+                if (compileRes.exitCode !== 0) {
+                    return testCases.map(() => ({
+                        stdout: null,
+                        stderr: null,
+                        compile_output: compileRes.stderr || compileRes.stdout,
+                        status: { id: 6, description: 'Compilation Error' },
+                        time: null,
+                        memory: null,
+                    }));
+                }
+                runCmd = binPath;
+                runArgs = [];
+            }
+            else if (language === 'java') {
+                const classMatch = sourceCode.match(/public\s+class\s+([A-Za-z0-9_]+)/);
+                const className = classMatch ? classMatch[1] : 'Main';
+                const srcPath = path_1.default.join(tempDir, `${className}.java`);
+                fs_1.default.writeFileSync(srcPath, sourceCode);
+                const compileRes = await this.runProcess('javac', [srcPath], '', tempDir, 8);
+                if (compileRes.exitCode !== 0) {
+                    return testCases.map(() => ({
+                        stdout: null,
+                        stderr: null,
+                        compile_output: compileRes.stderr || compileRes.stdout,
+                        status: { id: 6, description: 'Compilation Error' },
+                        time: null,
+                        memory: null,
+                    }));
+                }
+                runCmd = 'java';
+                runArgs = ['-cp', tempDir, className];
+            }
+            else {
+                throw new Error(`Unsupported language: ${language}`);
+            }
+            // 2. Execute all test cases concurrently against the compiled binary
+            const CONCURRENCY = 4;
+            const results = new Array(testCases.length);
+            for (let batch = 0; batch < testCases.length; batch += CONCURRENCY) {
+                const chunk = testCases.slice(batch, batch + CONCURRENCY);
+                const promises = chunk.map(async (tc, idx) => {
+                    const globalIdx = batch + idx;
+                    const startTime = Date.now();
+                    const execResult = await this.runProcess(runCmd, runArgs, tc.input, tempDir, timeLimit);
+                    const executionTime = (Date.now() - startTime) / 1000;
+                    if (execResult.timedOut) {
+                        results[globalIdx] = {
+                            stdout: null,
+                            stderr: 'Time Limit Exceeded',
+                            compile_output: null,
+                            status: { id: 5, description: 'Time Limit Exceeded' },
+                            time: timeLimit,
+                            memory: null,
+                        };
+                    }
+                    else if (execResult.exitCode !== 0) {
+                        results[globalIdx] = {
+                            stdout: execResult.stdout,
+                            stderr: execResult.stderr,
+                            compile_output: null,
+                            status: { id: 11, description: 'Runtime Error' },
+                            time: executionTime,
+                            memory: null,
+                        };
+                    }
+                    else {
+                        results[globalIdx] = {
+                            stdout: execResult.stdout,
+                            stderr: execResult.stderr,
+                            compile_output: null,
+                            status: { id: 3, description: 'Accepted' },
+                            time: executionTime,
+                            memory: null,
+                        };
+                    }
+                });
+                await Promise.all(promises);
+            }
+            return results;
+        }
+        finally {
+            try {
+                fs_1.default.rmSync(tempDir, { recursive: true, force: true });
+            }
+            catch {
+                // ignore cleanup error
+            }
+        }
+    }
+    // ──────────────────────────────────────────────
+    //  Shared Helpers
+    // ──────────────────────────────────────────────
+    getJudge0Headers() {
+        const headers = { 'Content-Type': 'application/json' };
+        if (this.apiKey)
+            headers['X-RapidAPI-Key'] = this.apiKey;
+        if (this.apiHost)
+            headers['X-RapidAPI-Host'] = this.apiHost;
+        return headers;
+    }
+    mapJudge0Response(data) {
         return {
             stdout: data.stdout || null,
             stderr: data.stderr || null,
@@ -93,207 +352,9 @@ class JudgeService {
             message: data.message || null,
         };
     }
-    /**
-     * Local sandboxed process runner (Fallback)
-     */
-    async executeViaLocal(language, sourceCode, stdin, timeLimit) {
-        const tempDir = fs_1.default.mkdtempSync(path_1.default.join(os_1.default.tmpdir(), 'code-arena-'));
-        const startTime = Date.now();
-        try {
-            if (language === 'python') {
-                const filePath = path_1.default.join(tempDir, 'solution.py');
-                fs_1.default.writeFileSync(filePath, sourceCode);
-                const execResult = await this.runProcess('python', [filePath], stdin, tempDir, timeLimit);
-                const executionTime = (Date.now() - startTime) / 1000;
-                if (execResult.timedOut) {
-                    return {
-                        stdout: null,
-                        stderr: 'Time Limit Exceeded',
-                        compile_output: null,
-                        status: { id: 5, description: 'Time Limit Exceeded' },
-                        time: timeLimit,
-                        memory: null,
-                    };
-                }
-                if (execResult.exitCode !== 0) {
-                    return {
-                        stdout: execResult.stdout,
-                        stderr: execResult.stderr,
-                        compile_output: null,
-                        status: { id: 11, description: 'Runtime Error' },
-                        time: executionTime,
-                        memory: null,
-                    };
-                }
-                return {
-                    stdout: execResult.stdout,
-                    stderr: execResult.stderr,
-                    compile_output: null,
-                    status: { id: 3, description: 'Accepted' },
-                    time: executionTime,
-                    memory: null,
-                };
-            }
-            else if (language === 'c') {
-                const srcPath = path_1.default.join(tempDir, 'solution.c');
-                const binPath = path_1.default.join(tempDir, os_1.default.platform() === 'win32' ? 'solution.exe' : 'solution');
-                fs_1.default.writeFileSync(srcPath, sourceCode);
-                // Compile
-                const compileRes = await this.runProcess('gcc', [srcPath, '-O2', '-o', binPath], '', tempDir, 8);
-                if (compileRes.exitCode !== 0) {
-                    return {
-                        stdout: null,
-                        stderr: null,
-                        compile_output: compileRes.stderr || compileRes.stdout,
-                        status: { id: 6, description: 'Compilation Error' },
-                        time: null,
-                        memory: null,
-                    };
-                }
-                // Execute
-                const execResult = await this.runProcess(binPath, [], stdin, tempDir, timeLimit);
-                const executionTime = (Date.now() - startTime) / 1000;
-                if (execResult.timedOut) {
-                    return {
-                        stdout: null,
-                        stderr: 'Time Limit Exceeded',
-                        compile_output: null,
-                        status: { id: 5, description: 'Time Limit Exceeded' },
-                        time: timeLimit,
-                        memory: null,
-                    };
-                }
-                if (execResult.exitCode !== 0) {
-                    return {
-                        stdout: execResult.stdout,
-                        stderr: execResult.stderr,
-                        compile_output: null,
-                        status: { id: 11, description: 'Runtime Error' },
-                        time: executionTime,
-                        memory: null,
-                    };
-                }
-                return {
-                    stdout: execResult.stdout,
-                    stderr: execResult.stderr,
-                    compile_output: null,
-                    status: { id: 3, description: 'Accepted' },
-                    time: executionTime,
-                    memory: null,
-                };
-            }
-            else if (language === 'cpp') {
-                const srcPath = path_1.default.join(tempDir, 'solution.cpp');
-                const binPath = path_1.default.join(tempDir, os_1.default.platform() === 'win32' ? 'solution.exe' : 'solution');
-                fs_1.default.writeFileSync(srcPath, sourceCode);
-                // Compile
-                const compileRes = await this.runProcess('g++', [srcPath, '-O2', '-o', binPath], '', tempDir, 8);
-                if (compileRes.exitCode !== 0) {
-                    return {
-                        stdout: null,
-                        stderr: null,
-                        compile_output: compileRes.stderr || compileRes.stdout,
-                        status: { id: 6, description: 'Compilation Error' },
-                        time: null,
-                        memory: null,
-                    };
-                }
-                // Execute
-                const execResult = await this.runProcess(binPath, [], stdin, tempDir, timeLimit);
-                const executionTime = (Date.now() - startTime) / 1000;
-                if (execResult.timedOut) {
-                    return {
-                        stdout: null,
-                        stderr: 'Time Limit Exceeded',
-                        compile_output: null,
-                        status: { id: 5, description: 'Time Limit Exceeded' },
-                        time: timeLimit,
-                        memory: null,
-                    };
-                }
-                if (execResult.exitCode !== 0) {
-                    return {
-                        stdout: execResult.stdout,
-                        stderr: execResult.stderr,
-                        compile_output: null,
-                        status: { id: 11, description: 'Runtime Error' },
-                        time: executionTime,
-                        memory: null,
-                    };
-                }
-                return {
-                    stdout: execResult.stdout,
-                    stderr: execResult.stderr,
-                    compile_output: null,
-                    status: { id: 3, description: 'Accepted' },
-                    time: executionTime,
-                    memory: null,
-                };
-            }
-            else if (language === 'java') {
-                // Detect class name or use Main
-                const classMatch = sourceCode.match(/public\s+class\s+([A-Za-z0-9_]+)/);
-                const className = classMatch ? classMatch[1] : 'Main';
-                const srcPath = path_1.default.join(tempDir, `${className}.java`);
-                fs_1.default.writeFileSync(srcPath, sourceCode);
-                // Compile
-                const compileRes = await this.runProcess('javac', [srcPath], '', tempDir, 10);
-                if (compileRes.exitCode !== 0) {
-                    return {
-                        stdout: null,
-                        stderr: null,
-                        compile_output: compileRes.stderr || compileRes.stdout,
-                        status: { id: 6, description: 'Compilation Error' },
-                        time: null,
-                        memory: null,
-                    };
-                }
-                // Execute
-                const execResult = await this.runProcess('java', ['-cp', tempDir, className], stdin, tempDir, timeLimit);
-                const executionTime = (Date.now() - startTime) / 1000;
-                if (execResult.timedOut) {
-                    return {
-                        stdout: null,
-                        stderr: 'Time Limit Exceeded',
-                        compile_output: null,
-                        status: { id: 5, description: 'Time Limit Exceeded' },
-                        time: timeLimit,
-                        memory: null,
-                    };
-                }
-                if (execResult.exitCode !== 0) {
-                    return {
-                        stdout: execResult.stdout,
-                        stderr: execResult.stderr,
-                        compile_output: null,
-                        status: { id: 11, description: 'Runtime Error' },
-                        time: executionTime,
-                        memory: null,
-                    };
-                }
-                return {
-                    stdout: execResult.stdout,
-                    stderr: execResult.stderr,
-                    compile_output: null,
-                    status: { id: 3, description: 'Accepted' },
-                    time: executionTime,
-                    memory: null,
-                };
-            }
-            throw new Error(`Unsupported language for local runner: ${language}`);
-        }
-        finally {
-            try {
-                fs_1.default.rmSync(tempDir, { recursive: true, force: true });
-            }
-            catch (cleanErr) {
-                // ignore cleanup error
-            }
-        }
+    sleep(ms) {
+        return new Promise((resolve) => setTimeout(resolve, ms));
     }
-    /**
-     * Helper to spawn a process with timeout, stdin, and buffer limits
-     */
     runProcess(cmd, args, stdin, cwd, timeoutSeconds) {
         return new Promise((resolve) => {
             let stdout = '';
@@ -308,7 +369,7 @@ class JudgeService {
                 try {
                     proc.kill('SIGKILL');
                 }
-                catch (e) {
+                catch {
                     // ignore
                 }
             }, timeoutSeconds * 1000);
@@ -318,33 +379,21 @@ class JudgeService {
             proc.stdin.end();
             proc.stdout.on('data', (data) => {
                 stdout += data.toString();
-                if (stdout.length > 512 * 1024) {
+                if (stdout.length > 512 * 1024)
                     proc.kill();
-                }
             });
             proc.stderr.on('data', (data) => {
                 stderr += data.toString();
-                if (stderr.length > 512 * 1024) {
+                if (stderr.length > 512 * 1024)
                     proc.kill();
-                }
             });
             proc.on('close', (code) => {
                 clearTimeout(timer);
-                resolve({
-                    stdout,
-                    stderr,
-                    exitCode: code,
-                    timedOut,
-                });
+                resolve({ stdout, stderr, exitCode: code, timedOut });
             });
             proc.on('error', (err) => {
                 clearTimeout(timer);
-                resolve({
-                    stdout: '',
-                    stderr: err.message,
-                    exitCode: 1,
-                    timedOut: false,
-                });
+                resolve({ stdout: '', stderr: err.message, exitCode: 1, timedOut: false });
             });
         });
     }

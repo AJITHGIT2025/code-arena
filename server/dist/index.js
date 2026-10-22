@@ -15,8 +15,6 @@ const statsRoutes_1 = __importDefault(require("./routes/statsRoutes"));
 dotenv_1.default.config();
 const app = (0, express_1.default)();
 const PORT = process.env.PORT || 5000;
-// Trust reverse proxy for accurate client IPs behind Render/Cloudflare/Nginx
-app.set('trust proxy', 1);
 // Security & Middlewares
 app.use((0, cors_1.default)({
     origin: process.env.CLIENT_URL ? [process.env.CLIENT_URL, 'http://localhost:5173', 'http://127.0.0.1:5173'] : '*',
@@ -27,17 +25,7 @@ app.use(express_1.default.urlencoded({ extended: true, limit: '2mb' }));
 // Rate limiter for execution and submission endpoints
 const executionLimiter = (0, express_rate_limit_1.default)({
     windowMs: 1 * 60 * 1000, // 1 minute
-    max: 120, // max 120 runs/submits per minute
-    keyGenerator: (req) => {
-        // If authenticated, rate limit per student token so whole computer labs sharing one Wi-Fi IP don't block each other
-        const authHeader = req.headers.authorization;
-        if (authHeader && authHeader.startsWith('Bearer ')) {
-            return authHeader.slice(7, 35);
-        }
-        return req.ip || 'anonymous';
-    },
-    standardHeaders: true,
-    legacyHeaders: false,
+    max: 30, // max 30 runs/submits per minute per IP
     message: { error: 'Too many execution requests. Please wait a moment before trying again.' },
 });
 // Route mounts

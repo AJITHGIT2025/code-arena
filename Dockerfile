@@ -33,6 +33,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 ENV NODE_ENV=production
 ENV PORT=5000
+ENV EXECUTION_ENGINE=local
 
 # Copy built server package definitions & production dependencies
 COPY server/package*.json ./server/
@@ -43,11 +44,10 @@ COPY --from=server-builder /app/server/dist ./dist
 COPY --from=server-builder /app/server/prisma ./prisma
 COPY --from=server-builder /app/server/node_modules/.prisma ./node_modules/.prisma
 COPY --from=server-builder /app/server/node_modules/@prisma ./node_modules/@prisma
-COPY server/scripts ./scripts
 
 # Copy built client to where the Express server serves static assets
 COPY --from=client-builder /app/client/dist /app/client/dist
 
 EXPOSE 5000
 
-CMD ["sh", "-c", "node scripts/init-db.js && node dist/index.js"]
+CMD ["sh", "-c", "npx prisma db push && node dist/db/seed.js && node dist/index.js"]

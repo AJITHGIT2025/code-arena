@@ -51,7 +51,7 @@ export const runCode = async (req: AuthenticatedRequest, res: Response): Promise
       return;
     }
 
-    // 2. Run against problem's sample test cases
+    // 2. Run against problem's sample test cases (BATCH)
     if (!problemId) {
       res.status(400).json({ error: 'problemId is required when no custom input is provided.' });
       return;
@@ -73,7 +73,6 @@ export const runCode = async (req: AuthenticatedRequest, res: Response): Promise
 
     const testCases = problem.sampleTestCases;
     if (testCases.length === 0) {
-      // If problem has no sample test cases, run with empty stdin
       const result = await judgeService.execute(language as SupportedLanguage, sourceCode, '');
       res.json({
         isCustomInput: false,
@@ -94,21 +93,25 @@ export const runCode = async (req: AuthenticatedRequest, res: Response): Promise
       return;
     }
 
+    // ── BATCH EXECUTION: All sample cases at once ──
+    const batchInputs = testCases.map((tc) => ({ input: tc.inputData }));
+    const batchResults = await judgeService.executeBatch(
+      language as SupportedLanguage,
+      sourceCode,
+      batchInputs,
+      problem.timeLimit,
+      problem.memoryLimit
+    );
+
     const results = [];
     let allPassed = true;
     let compilationError = false;
 
     for (let i = 0; i < testCases.length; i++) {
       const tc = testCases[i];
-      const result = await judgeService.execute(
-        language as SupportedLanguage,
-        sourceCode,
-        tc.inputData,
-        problem.timeLimit,
-        problem.memoryLimit
-      );
+      const result = batchResults[i];
 
-      // Check for compilation error
+      // Compilation error
       if (result.status.id === 6 || result.compile_output) {
         compilationError = true;
         results.push({
@@ -121,7 +124,6 @@ export const runCode = async (req: AuthenticatedRequest, res: Response): Promise
           executionTime: 0,
           errorMessage: result.compile_output || result.stderr,
         });
-        // Stop evaluating rest on compilation error
         allPassed = false;
         break;
       }
@@ -160,9 +162,7 @@ export const runCode = async (req: AuthenticatedRequest, res: Response): Promise
       const normalizedExpected = judgeService.normalizeOutput(tc.expectedOutput);
       const passed = normalizedActual === normalizedExpected;
 
-      if (!passed) {
-        allPassed = false;
-      }
+      if (!passed) allPassed = false;
 
       results.push({
         testCaseIndex: i + 1,
@@ -180,6 +180,7 @@ export const runCode = async (req: AuthenticatedRequest, res: Response): Promise
       isCustomInput: false,
       allPassed,
       compilationError,
+      status: compilationError ? 'COMPILATION ERROR' : allPassed ? 'ALL SAMPLE CASES PASSED' : 'SOME CASES FAILED',
       results,
     });
   } catch (error: any) {
@@ -243,45 +244,43 @@ export const submitCode = async (req: AuthenticatedRequest, res: Response): Prom
     let errorMessage: string | null = null;
     let maxExecutionTime = 0;
 
+    // ── BATCH EXECUTION: All hidden test cases at once ──
+    const batchInputs = testCasesToEvaluate.map((tc) => ({ input: tc.inputData }));
+    const batchResults = await judgeService.executeBatch(
+      language as SupportedLanguage,
+      sourceCode,
+      batchInputs,
+      problem.timeLimit,
+      problem.memoryLimit
+    );
+
     // Evaluation item summary for student (WITHOUT exposing hidden test inputs/outputs!)
     const caseSummaries = [];
 
     for (let i = 0; i < totalTestCases; i++) {
       const tc = testCasesToEvaluate[i];
-      const result = await judgeService.execute(
-        language as SupportedLanguage,
-        sourceCode,
-        tc.inputData,
-        problem.timeLimit,
-        problem.memoryLimit
-      );
+      const result = batchResults[i];
 
       const caseTime = parseFloat(result.time as string) || 0;
-      if (caseTime > maxExecutionTime) {
-        maxExecutionTime = caseTime;
-      }
+      if (caseTime > maxExecutionTime) maxExecutionTime = caseTime;
 
       // 1. Compilation Error
       if (result.status.id === 6 || result.compile_output) {
         overallStatus = 'Compilation Error';
         errorMessage = result.compile_output || result.stderr || 'Compilation error occurred.';
         caseSummaries.push({
-          testCaseIndex: i + 1,
-          passed: false,
-          status: 'Compilation Error',
-          executionTime: 0,
+          testCaseIndex: i + 1, passed: false,
+          status: 'Compilation Error', executionTime: 0,
         });
-        break; // Stop evaluating remaining cases
+        break;
       }
 
       // 2. Time Limit Exceeded
       if (result.status.id === 5) {
         if (overallStatus === 'Accepted') overallStatus = 'Time Limit Exceeded';
         caseSummaries.push({
-          testCaseIndex: i + 1,
-          passed: false,
-          status: 'Time Limit Exceeded',
-          executionTime: problem.timeLimit,
+          testCaseIndex: i + 1, passed: false,
+          status: 'Time Limit Exceeded', executionTime: problem.timeLimit,
         });
         continue;
       }
@@ -291,10 +290,8 @@ export const submitCode = async (req: AuthenticatedRequest, res: Response): Prom
         if (overallStatus === 'Accepted') overallStatus = 'Runtime Error';
         if (!errorMessage) errorMessage = result.stderr;
         caseSummaries.push({
-          testCaseIndex: i + 1,
-          passed: false,
-          status: 'Runtime Error',
-          executionTime: caseTime,
+          testCaseIndex: i + 1, passed: false,
+          status: 'Runtime Error', executionTime: caseTime,
         });
         continue;
       }
@@ -307,18 +304,14 @@ export const submitCode = async (req: AuthenticatedRequest, res: Response): Prom
       if (passed) {
         passedTestCases++;
         caseSummaries.push({
-          testCaseIndex: i + 1,
-          passed: true,
-          status: 'Passed',
-          executionTime: caseTime,
+          testCaseIndex: i + 1, passed: true,
+          status: 'Passed', executionTime: caseTime,
         });
       } else {
         if (overallStatus === 'Accepted') overallStatus = 'Wrong Answer';
         caseSummaries.push({
-          testCaseIndex: i + 1,
-          passed: false,
-          status: 'Wrong Answer',
-          executionTime: caseTime,
+          testCaseIndex: i + 1, passed: false,
+          status: 'Wrong Answer', executionTime: caseTime,
         });
       }
     }
@@ -329,7 +322,6 @@ export const submitCode = async (req: AuthenticatedRequest, res: Response): Prom
       if (overallStatus === 'Accepted' && passedTestCases === totalTestCases) {
         pointsEarned = problem.points;
       } else {
-        // Partial scoring based on fraction of test cases passed
         pointsEarned = Math.floor((passedTestCases / totalTestCases) * problem.points);
       }
     }
